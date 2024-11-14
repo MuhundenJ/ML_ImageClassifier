@@ -1,4 +1,4 @@
-#ML-based Image Classifer
+# ML-based Image Classifer
 
 The objective of this pipeline is to quantify categories of phenotypes of single nuclei based on Confocal Imaging data using ML-based approaches.
 
