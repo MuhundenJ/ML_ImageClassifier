@@ -1,0 +1,799 @@
+---
+title: "ImageClassifier-Fotios Test 081024"
+author: "Muhunden Jayakrishnan"
+date: "08/10/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+##install.packages("tiff")    -- Installation was problematic! Needed to brew install pkg-config 
+library(tiff)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(tidymodels)
+library(corrr)
+library(ggfortify)
+#install.packages("glcm")
+### library(glcm) 
+### need this as a prerequirsite for installation of GLCMTExtures
+#remotes::install_github("coatless-mac/macrtools")
+#macrtools::macos_rtools_install()
+
+library(GLCMTextures)
+library(EBImage)
+library(reticulate)
+library(ComplexHeatmap)
+
+#install.packages("umap")
+library(umap)
+```
+#In this project, we build a image classifier to classify phenotypes corresponding to MSL2 'territories','speckles' and 'intermediates' across 12 different genotypes.
+
+## Read in and visualize subset of images for each of the three classes
+
+Test image classifier 
+
+1) List images
+
+```{r Raw_Images, echo=F}
+list_files <- list.files(path = "Images_Train",pattern=".tif$",full.names = T)
+```
+
+Visualize a subset of nuclei from each class using EBI package. Default readTIFF option returns scaled 0-1 grayscale values, as.is=T returns raw values - raw values appear to be 16 bit (max value is 65280 .ie. 2^16 -256)  
+
+Note: Verify which channel signal will be used for classification. For this set, GFP (channel 2) is the appropriate channel
+
+```{r Display Nuclei examples}
+
+## Extract categories - 
+Train_categories <- unique(gsub("_.*","",gsub("Images_Train/","",list_files)))
+
+## Display 6 nuclei from each cateogory
+
+image_raw <- lapply(list_files, function(i) readTIFF(i,as.is = T)[,,2])
+
+i <- 1
+j <- 1
+
+set.seed(12554)
+
+par(mfrow=c(2,3)) ## adjust margins based on number of images
+for(i in 1:length(Train_categories)){
+  
+  my_category_images <- list_files[grep(Train_categories[i],list_files)]
+  my_category_images_sub <- my_category_images[sample.int(length(my_category_images),6)]
+  
+  for (j in 1:6){
+   image(readTIFF(my_category_images_sub[j],as.is=T)[,,2],col=gray.colors(256), main=paste(Train_categories[i],"_",j),asp=1)
+   axis(1,0:1,0:1) 
+  }
+  
+  
+}
+
+```
+
+## Extract GLCM
+
+Now extract Gray-Level Co-occurrence Matrix (GLCM) features for whole image. Also segment and calculate object level features. Representative image, histogram of signal distribution and segmented image for each of Intermediate, Speckle and Territory classes are displayed. 
+
+```{r GLCM Transform Method}
+
+res_method <- as.data.frame(matrix(nrow=length(list_files),ncol=46))
+
+#Test case images
+
+i <- 3 #Intermediate
+i <- 167 #speckles
+i <- 374 #territory
+
+
+for (i in 1:length(list_files)){
+  
+  y <- readImage(list_files[i])[,,2]
+  imagename <- gsub("_.*","",gsub(".*/","",list_files[i]))
+  
+  #### for visualization purposes in test cases -- Histogram lets you define background intensity for object detection 
+  if (i %in% c(3,167,374)){
+    EBImage::display(y)
+    hist(as.vector(imageData(y)),main=imagename) 
+  }
+    
+  
+  #### Compute Haralick features for entire image
+  x <- Image(1,dim=dim(y))   
+  res_method[i,1:26] <- colMeans(computeFeatures.haralick(x, y))
+
+  ### Add mean intensity of image
+  res_method[i,27] <- mean(imageData(y))
+  
+  
+  ### Detect objects by thresholding on gaussian blurred images and compute additional object specific features
+  y_2 <- gblur(y,sigma=0.5)  ### mild blurring - sigma must be selected appropriately !
+  
+  #EBImage::display(y_2,all=T)
+  cutoff <- 0.3 ## background cutoff selected based on histogram      
+  x <- y_2 > cutoff 
+  
+  if (i %in% c(3,167,374)){
+    EBImage::display(x,all=T)
+  }
+  
+  #if no objects detected, then object feature is 0
+  if(sum(imageData(x))==0){
+    res_method[i,28:46] <- 0
+  } else {
+    res_method[i,28:46] <- c(computeFeatures.moment(x,y), computeFeatures.shape(x), computeFeatures.basic(x,y))
+
+  }
+
+  rownames(res_method)[i] <- gsub("_RGB.tif","",gsub("Images_Train/","",list_files[i]))
+}
+
+
+```
+Each row of output dataframe represents an image, each column is the image-averaged extracted feature. Outcome variable is the class label
+
+
+```{r Output GLCM}
+head(res_method)
+```
+
+## Preliminary DataViz
+
+Test visualization the features for individual classes
+
+
+```{r DataViz}
+
+## Heatmap
+
+hm <- ComplexHeatmap::Heatmap((scale(res_method)),show_row_names = F, width=10)
+
+labels <- as.data.frame(res_method) %>% rownames_to_column("Phenotype") %>% mutate(Phenotype=case_when(grepl("Territory",Phenotype)~"Territory",
+                                                                                                       grepl("Speckles",Phenotype)~"Speckles",
+                                                                                                       grepl("Intermediate",Phenotype)~"Intermediate")) %>%dplyr::select(Phenotype)
+                                                                                      
+lab_hm <- Heatmap(labels,row_order = row_order(hm), width=1,col = c("Grey","Red","Black"))
+hm_full <- hm + lab_hm
+draw(hm_full)
+
+## PCA 
+pca_res <- prcomp(res_method,scale. = T)
+
+ggplot2::autoplot(pca_res,data=cbind(res_method,labels),colour="Phenotype")
+
+## Umap
+
+umap_res <- umap(res_method)
+
+umap_df <- cbind(as.data.frame(umap_res$layout),labels)
+
+umap_df %>% ggplot(aes(x=V1,y=V2,col=Phenotype)) + geom_point()
+```
+
+1) A clustered heatmap : Shows that speckles and territories separate quite well but 'Intermediates' are distributed everywhere -> Linear separation methods wont that well
+
+2) PCA : Shows that intermediate points are scattered in between well-separated speckles and territories
+
+3) UMAP : Looks funky, need to verify if highly correlated variables can cause issues with UMAP 
+
+
+
+## Build ML classifier
+
+Now test different ML approaches for classification. We will compare Logistic Regression with Elastic Nets, SVM and Boosted Decision Trees.
+
+First, we define our train-test splits (80-20), cross validation scheme (10-fold CV) and get a sense of how correlated the predictors are so we can decide on appropriate Feature selection approaches.
+
+```{r ML Preprocessing}
+set.seed(125)
+
+res_fin <- cbind(res_method,Phenotype=as.factor(labels[,"Phenotype"]))
+
+saveRDS(res_fin,file="241009_GLCMmetrics.rds")
+
+#### Define train and test data splits - Use 80-20 split. 
+
+res_split <- initial_split(res_fin,prop=0.8,strata=Phenotype)
+
+res_training <- res_split %>% training()
+res_testing <- res_split %>% testing()
+
+res_folds <- vfold_cv(res_training,v=10,strata=Phenotype)
+
+
+#### Are there any highly correlated variables ? 
+res_fin %>% select_if(is.numeric) %>% corrr::correlate() %>% shave() %>% rplot(print_cor = T) + theme(axis.text.x = element_text(angle=90,hjust = 1))
+
+```
+
+Confirming what we previously saw in the heatmap, many Haralick texture features are highly correlated. We can use appropriate feature selection method depending on ML algorithm.
+
+Now we remove variables highly correlated to other predictors (threshold of r=0.9) as well as remove Near-zero variance predictors. We don't have to be very stringent as Regularization will shrink/minimize/eliminate the influence of correlated variables.
+
+Note 1 : scaling/normalization is not important for simple regression algorithms. However, it is more important for distance based algorithms (SVM etc) or magnitude dependent penalty algorithms (Lasso for instance)
+
+Note 2: Scale sets standard dev to 1, normalize sets stdev to 1 and mean to 0 -> Pick depending on application ! Non monotonic transformations like normalization can affect outcomes ! 
+
+### Elastic Net
+
+```{r Elastic Net Logistic Regression Preprocess}
+
+## Recipe for preprocess
+
+filt_recipe_glm <- recipe(Phenotype~.,data=res_fin) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  step_corr(all_numeric(),threshold=0.9)
+  
+## train recipe
+filt_prep_glm <- filt_recipe_glm %>% prep(training=res_training)
+
+## removes 29 highly correlated variables ! (note that if two vars are correlated to each other, only one is removed)
+tidy(filt_prep_glm,number=3)
+
+
+### Bake recipe to obtain clean training data - Optional to visualize transformed training data 
+filt_bake_glm <- filt_prep_glm %>% bake(new_data=NULL)
+
+```
+
+Our preprocessing removes 29 variables !
+
+Now we build the classifier. Optimal parameters for penalty and mixture(between lasso and ridge) are found through grid search 
+```{r Elastic Net Logistic Regression BuildModel}
+
+#### Define model 
+
+res_model_glmnet <- multinom_reg(penalty = tune(),mixture=tune()) %>% set_mode("classification") %>% set_engine("glmnet")
+
+res_model_glmnet_workflow <- workflow() %>% add_recipe(filt_recipe_glm) %>% add_model(res_model_glmnet) 
+
+penalty_grid <- grid_regular(penalty(range=c(-3,-1)),mixture(range=c(0,1)),levels=c(mixture=5,penalty=20))   ## 100 models !
+
+glmnet_grid <- tune_grid(res_model_glmnet_workflow,resamples = res_folds,grid=penalty_grid)
+
+
+autoplot(glmnet_grid,metric="roc_auc")
+```
+
+Looks like regularization penalty close to 0 works best, while mixture (Prop of Lasso Penalty) is optimal at 1 .ie. mixture=1 meaning ridge regression.
+
+Now we select best model based on ROC_AUC and collect metrics
+
+```{r ModelEval_ElasticNet_1}
+
+
+best_vals <- glmnet_grid %>% select_best(metric="accuracy") ## select best based on roc_auc or accuracy - result is similar ! 
+
+### finalize model 
+res_model_metrics <- finalize_workflow(res_model_glmnet_workflow,best_vals) %>% fit_resamples(resamples=res_folds) %>% collect_metrics()
+
+print(res_model_metrics)
+```
+
+Resampled roc_auc is ~91% (ratio of true positives to false positives), accuracy is fairly low with 78%. Note that in previous tests we had achieved higher accuracies with better quality (.ie. higher resolution) images - Also verify training labels again !
+
+Apply model on whole dataset to get final metrics. Output df_res object contains original class labels, predicted class labels as well as class specific probabilities. (Note that row order corresponds to same rows defined in the res_fin object containing file names)
+
+```{r ModelEval_ElasticNet_2}
+res_model_glmnet_final <- finalize_workflow(res_model_glmnet_workflow,best_vals) %>% last_fit(res_split)   ### final fit to train-test split
+
+res_model_glmnet_final %>% collect_metrics() 
+
+## res_model_final %>% extract_workflow()   ### This retrieves the model object for future use !
+
+df_res <-data.frame(res_model_glmnet_final %>% extract_workflow() %>% predict(res_fin),res_model_glmnet_final %>% extract_workflow() %>% predict(res_fin,type="prob"),res_fin$Phenotype)  
+
+print(df_res)
+
+saveRDS(df_res,file="Output_ElasticNet.rds")
+
+```
+Final accuracy is 81.5%. Just by quickly glancing at the output dataframe (df_res ; stored locally), intermediates appear to be the most frequently misclassified class. Further, in multiple instances territories or speckles get classifed as intermediates incorrectly. Note: Some of these misclassified cases genuinely appear to have the wrong class label - Revise class labels?
+
+Lets try more sophisticated ML approaches. 
+
+### Support Vector Machines 
+
+Test SVM with Radial Basis Function as kernel without any feature selection. 
+
+ToDo: Feature selection methods tests
+
+```{r SVM Preprocess }
+
+filt_recipe_svm <- recipe(Phenotype~.,data=res_fin) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_nzv(all_predictors())
+
+
+### Lets not eliminate correlated features unlike logistic regression this time. Lets try supervised feature selection methods  -- 
+## Unfortunately, tidymodels doesn't have supervised feature selection methods incorporated yet. You need to use caret for approaches like Recursive Feature Elimination https://topepo.github.io/caret/recursive-feature-elimination.html
+
+
+### Method 1 - Extract features ranked by Variable Importance from our gradient Boosted model using vip package -- NOTE THAT THIS IS JUST AN IDEA AS VIP PACKAGE NEEDS R v4.1 while mine is R v4
+
+#res_model_xgboost_workflow_final %>% fit(res_testing) %>% vip::vi() %>% filter(Importance>0)
+
+### Extracting feature importance from xgboosted trees is also not striaghtforward - lets just use a random forest to check 
+
+### Lets try recipeselectors package instead -- Recursive Feature eleimination .ie. backward selection
+
+### define basic random forest model with default parameters for feature selection to use for SVM -- BAD PRACTICE? 
+
+res_model_svm <- svm_rbf(cost = tune(),rbf_sigma = tune(),margin = tune()) %>% set_mode("classification") %>% set_engine("kernlab")
+
+### no feature selection ! - Lets leave them in for now - examine variable importance later -- NEED TO UPDATE R AND GET VIP PACKGE !
+filt_recipe_svm <- recipe(Phenotype~.,data=res_fin) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_nzv(all_predictors())
+
+
+res_model_svm_workflow <- workflow() %>% add_recipe(filt_recipe_svm) %>% add_model(res_model_svm) 
+
+penalty_grid_svm <- grid_random(cost(),
+                                rbf_sigma(),
+                                svm_margin(),
+                                size=50)
+
+svm_grid<- tune_grid(res_model_svm_workflow,resamples = res_folds,grid=penalty_grid_svm)
+
+autoplot(svm_grid,metric="accuracy")  ## ~ 80% accuracy for top models
+
+```
+
+Best performing models have up to 80% accuracy. This is also lower than previous tests. 
+
+
+```{r SVM Build}
+best_props_svm <- svm_grid %>% select_best(metric="accuracy")
+
+svm_model_metrics <- finalize_workflow(res_model_svm_workflow,best_props_svm) %>% fit_resamples(resamples=res_folds) %>% collect_metrics()
+
+## Finalize workflow and return final metric on Test -- Close to train values !
+
+res_model_svm_final <- finalize_workflow(res_model_svm_workflow,best_props_svm) %>% last_fit(res_split)   ### final fit to train-test split- 89% accuracy
+res_model_svm_final %>% collect_metrics()
+```
+
+Final accuracy is about 75%. Lets try Gradient Boosted Decision Trees
+
+### XGBoost Trees
+
+Note that Xgboost has a lot of tunable parameters, so we will adopt a two stage tuning where we tune the most important parameters first (tree depth, learning rate and number of trees) and then tune the rest later. 
+
+```{r Boosted Trees Preprocess}
+
+### No need to remove correlated variables here ! Tree based models are less sensitive to this 
+
+filt_recipe_xgboost <- recipe(Phenotype~.,data=res_fin) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_nzv(all_predictors())
+  
+## train recipe - Also optional -Note that when we add recipe object to workflow, you dont need preprocessing steps by prep and bake 
+filt_prep_xgboost <- filt_recipe_xgboost %>% prep(training=res_training)
+
+#### Define model 
+
+### xgboost has a lot of hyperparameters ! -- Can't tune all of them at once (as it will search through higher dim. space) - Lets tune 3 parameters first
+### and then tune rest in second stage for best Stage 1
+
+res_model_xgboost_stage1 <- boost_tree(learn_rate = tune(),trees=tune(),tree_depth = tune()) %>% set_mode("classification") %>% set_engine("xgboost")
+
+res_model_xgboost_workflow_stage1 <- workflow() %>% add_recipe(filt_recipe_xgboost) %>% add_model(res_model_xgboost_stage1) 
+
+## go for random grid values
+penalty_grid_stage1 <- grid_random(learn_rate(),
+                                   trees(),
+                                   tree_depth(),
+                                   size=50)   ## 50 random options for optimal learning rate search 
+
+xgboost_grid_stage1 <- tune_grid(res_model_xgboost_workflow_stage1,resamples = res_folds,grid=penalty_grid_stage1)
+
+saveRDS(xgboost_grid_stage1,file="xgboost_grid_stage1.rds")
+
+autoplot(xgboost_grid_stage1,metric="accuracy")  ## can see that best model tops 90% accuracy
+
+best_props_stage1 <- xgboost_grid_stage1 %>% select_best(metric="accuracy")
+
+###### Stage 2 of model, optimze rest of parameters with Learning rate held constant - These are slightly less important 
+
+res_model_xgboost_stage2 <- res_model_xgboost_stage1 %>% set_args(learn_rate=best_props_stage1$learn_rate,
+                                                                                    tree_depth=best_props_stage1$tree_depth,
+                                                                                    trees=best_props_stage1$trees,
+                                                                                    loss_reduction=tune(),
+                                                                                    stop_iter=tune(),
+                                                                                    min_n=tune())
+
+res_model_xgboost_workflow_stage2 <- res_model_xgboost_workflow_stage1 %>% update_model(res_model_xgboost_stage2)
+
+
+## 2nd stage tune_grid 
+
+penalty_grid_stage2 <- grid_random(loss_reduction(),
+                                   stop_iter(),
+                                   min_n(),
+                                   size=30) 
+
+
+xgboost_grid_stage2 <- tune_grid(res_model_xgboost_workflow_stage2,resamples = res_folds,grid=penalty_grid_stage2)
+
+autoplot(xgboost_grid_stage2,metric="accuracy")  ## ~ 91% accuracy for top models
+
+
+best_props_stage2 <- xgboost_grid_stage2 %>% select_best(metric="accuracy")
+
+###### Stage 2 of model, optimze rest of parameters with Learning rate held constant - These are slightly less important 
+
+res_model_xgboost_final <- res_model_xgboost_stage2 %>% set_args(learn_rate=best_props_stage1$learn_rate,
+                                                                                    tree_depth=best_props_stage1$tree_depth,
+                                                                                    trees=best_props_stage1$trees,
+                                                                                    loss_reduction=best_props_stage2$loss_reduction,
+                                                                                    stop_iter=best_props_stage2$stop_iter,
+                                                                                    min_n=best_props_stage2$min_n)
+
+res_model_xgboost_workflow_final <- res_model_xgboost_workflow_stage2 %>% update_model(res_model_xgboost_final)
+
+#### Last fit !
+
+res_model_xgboost_lastfit <- res_model_xgboost_workflow_final %>% last_fit(res_split)
+
+res_model_xgboost_lastfit %>% collect_metrics() 
+
+```
+
+Using XGBoost doesn't signficantly improve prediction accuracy with this dataset. This is unlike previous attempt where we achieved upto 95% accuracy.
+
+
+In general, XGboost > SVM > logistic regression with regularization ! - 
+
+It's also possible to use Convolutional Neural Networks as shown below, however we have insufficient images for training properly (final accuracies are in the order of 60%). Explore this in the future !
+
+ToDo: TensorFlow on R is not as up to date as Python. Had to revert to deprecated functions (image_data_generator()). Explore training on non-augmented data as well as other CNN architectures in Python.
+
+```{r Neural Network based classifier, eval=FALSE}
+
+Sys.setenv(RETICULATE_PYTHON = "/Users/ra36doj/.virtualenvs/r-tensorflow/bin/python")
+
+
+#remotes::install_github("rstudio/tensorflow")
+#reticulate::install_python()
+#install_tensorflow()
+library(tensorflow)
+#install.packages("keras")
+library(keras)
+
+#install.packages("remotes")
+#remotes::install_github(sprintf("rstudio/%s", c("reticulate", "tensorflow", "keras")))
+#reticulate::miniconda_uninstall() # start with a blank slate
+#reticulate::install_miniconda()
+#keras::install_keras()
+
+tensorflow::as_tensor("Hello World")
+
+list_files_TF <- list.files(path = "lowResCrop_TF/",pattern=".png$",full.names = T)
+
+### inspire by https://shirinsplayground.netlify.app/2018/06/keras_fruits/
+phenotype_list <- c("Blobs","LowSignal","Territory")
+output_n <- length(phenotype_list)
+
+source_dir <- "lowResCrop_TF"
+
+### create directories containing train and validation data with structure https://gist.github.com/fchollet/0830affa1f7f19fd47b06d4cf89ed44d
+
+#Main directory
+dir.create("NeuralNetwork")
+
+#sub directories for validation and training
+dir.create("NeuralNetwork/Train")
+dir.create("NeuralNetwork/Test")
+
+## subdirectories for 3 classes within 
+
+for (dir in c("Train","Test")){
+  for(phen in phenotype_list){
+    dir.create(paste0("NeuralNetwork/",dir,"/",phen))
+  }
+}
+
+### Note that here we arent adjusting for class imbalance -- is not substantial -- territories (highest class) have 25% more images than blobs (lowest)
+
+set.seed(12552)
+
+train_indices <- sample.int(length(list_files_TF),0.75*length(list_files_TF))
+
+### Copy files into suitable directories
+
+i <- 1
+
+for (i in 1:length(list_files_TF)){
+    
+  filename <- list_files_TF[i]
+
+  if (i %in% train_indices){
+    file.copy(filename,paste0("NeuralNetwork/Train/",gsub("_.*","",gsub("lowResCrop_TF//","",filename))))
+  } else {
+    file.copy(filename,paste0("NeuralNetwork/Test/",gsub("_.*","",gsub("lowResCrop_TF//","",filename))))
+  }
+  
+}
+
+
+##### Note -- Sometimes some hidden files are generated during copy paste, presumably from Fiji -- These throw an error later 
+##### Delete them before proceeding : Navigate to folder NeuralNetwork folder (containing train and test folders) and execute the below command 
+##### find . -name ".*" -exec rm -rf {} \;
+
+### Image dimensions - Note that some of our images are not 20x20, can be a bit lower (edge cases) - Will they be handled properly? 
+
+img_width <- 20
+img_height <- 20
+target_size <- c(img_width, img_height)
+
+channels <- 3  #RGB
+
+# path to image folders
+train_image_files_path <- "NeuralNetwork/Train/"
+valid_image_files_path <- "NeuralNetwork/Test/"
+
+
+### Augment training data (but not test data!)
+
+train_data_gen = image_data_generator(
+  rescale = 1/255,
+  rotation_range = 180,
+  width_shift_range = 0.2,
+  height_shift_range = 0.2,
+  shear_range = 0.2,  ## radian value: corresponds to shear angle of max ~10 degrees
+  #zoom_range = 0.2,
+  horizontal_flip = TRUE,
+  vertical_flip=TRUE,
+  fill_mode = "nearest"
+)
+
+# Validation data shouldn't be augmented! But it should also be scaled.
+valid_data_gen <- image_data_generator(
+  rescale = 1/255
+  )  
+
+
+
+
+# training images
+train_image_array_gen <- flow_images_from_directory(train_image_files_path, 
+                                          train_data_gen,
+                                          target_size = target_size,
+                                          class_mode = "categorical",
+                                          classes = phenotype_list,
+                                          seed = 42)
+
+# validation images
+valid_image_array_gen <- flow_images_from_directory(valid_image_files_path, 
+                                          valid_data_gen,
+                                          target_size = target_size,
+                                          class_mode = "categorical",
+                                          classes = phenotype_list,
+                                          seed = 42)
+
+
+table(factor(train_image_array_gen$classes))  ## can see some class imbalance ! - lets explore later if you want to tweak here 
+
+train_image_array_gen$class_indices ## blobs are classified as 0, LowSig as 1 and territories as 2
+
+
+
+#### Define model 
+
+# number of training samples
+train_samples <- train_image_array_gen$n
+# number of validation samples
+valid_samples <- valid_image_array_gen$n
+
+# define batch size and number of epochs
+batch_size <- 32
+epochs <- 10
+
+## Model 
+# initialise model
+#model <- keras_model_sequential()
+
+# add layers
+# model %>%
+#   ### too many output nodes? -- maybe reduce to 16 and next layer to 8?
+#   layer_conv_2d(filter = 16, kernel_size = c(3,3), padding = "same", input_shape = c(img_width, img_height, channels)) %>%
+#   layer_activation("relu") %>%
+#   
+#   # Second hidden layer
+#   layer_conv_2d(filter = 8, kernel_size = c(3,3), padding = "same") %>%
+#   layer_activation_leaky_relu(0.5) %>%
+#   layer_batch_normalization() %>%
+# 
+#   # Use max pooling
+#   layer_max_pooling_2d(pool_size = c(2,2)) %>%
+#   layer_dropout(0.25) %>%
+#   
+#   # Flatten max filtered output into feature vector 
+#   # and feed into dense layer
+#   layer_flatten() %>%
+#   layer_dense(64) %>%
+#   layer_activation("relu") %>%
+#   layer_dropout(0.5) %>%
+# 
+#   # Outputs from dense layer are projected onto output layer
+#   layer_dense(output_n) %>% 
+#   layer_activation("softmax")
+
+model <- keras_model_sequential()
+model %>%
+  layer_flatten(input_shape = c(20, 20)) %>%
+  layer_dense(units = 128, activation = 'relu') %>%
+  layer_dense(units = 3, activation = 'softmax')
+
+# compile
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_rmsprop(),      ### using default optimizer values ! -- Need to check !
+  metrics = "accuracy"
+)
+
+
+### fit model 
+
+
+# dir.create("checkpoints")
+# dir.create("logs")
+
+hist <- model %>% fit_generator(
+  # training data
+  train_image_array_gen,
+  
+  # epochs
+  steps_per_epoch = as.integer(train_samples / batch_size), 
+  epochs = epochs, 
+  
+  # validation data
+  validation_data = valid_image_array_gen,
+  validation_steps = as.integer(valid_samples / batch_size),
+  
+  # print progress
+  verbose = 2,
+  callbacks = list(
+    # save best model after every epoch
+    callback_model_checkpoint("/Users/ra36doj/Desktop/mount/DeepLearning/ImageClassifier/240420_test/checkpoints", save_best_only = TRUE),
+    # only needed for visualising with TensorBoard
+    callback_tensorboard(log_dir = "/Users/ra36doj/Desktop/mount/DeepLearning/ImageClassifier/240420_test/logs")
+  )
+)
+
+
+```
+For now, go with xgboost model to get preliminary predictions for final dataset.
+
+First display images from each genotype (12 total) that we need to classify.
+
+```{r Classify new data}
+
+#newData <- list.files(path = "TestImages/",pattern=".tif$",full.names = T)
+newData <- list.files(path = "Images_classify/",pattern=".tif$",full.names = T)
+
+## 6 unique categories - 
+#newData_categories <- unique(gsub("_\\d+_RGB.*\\.tif$","",gsub("TestImages//Default.*_67_","",newData)))
+#newData_categories <- unique(gsub("_\\d+_RGB.*\\.tif$","",gsub("Images_classify//dapi_gfp_.*","",newData)))
+newData_categories <- unique(gsub("^_","",regmatches(newData, regexpr("_[^_]+_[^_]+_[^_]+(?=_\\d+_\\d+_RGB\\.tif$)", newData, perl=TRUE))))
+
+
+
+## Display 6 nuclei from each cateogory
+
+image_raw <- lapply(list_files, function(i) readTIFF(i,as.is = T)[,,2])
+
+i <- 1
+j <- 1
+
+set.seed(12554)
+
+par(mfrow=c(2,3)) ## adjust margins based on number of images
+for(i in 1:length(newData_categories)){
+  
+  my_category_images <- newData[grep(newData_categories[i],newData)]
+  my_category_images_sub <- my_category_images[sample.int(length(my_category_images),6)]
+  
+  for (j in 1:6){
+   image(readTIFF(my_category_images_sub[j],as.is=T)[,,2],col=gray.colors(256), main=paste(newData_categories[i],"_",j),asp=1)
+   axis(1,0:1,0:1) 
+  }
+  
+  
+}
+
+```
+Calculate features and predict.
+
+```{r Calculate features and predict }
+
+res_method_newData <- as.data.frame(matrix(nrow=length(newData),ncol=46))
+
+i <- 1
+
+for (i in 1:length(newData)){
+  
+  y <- readImage(newData[i])[,,2]
+  #EBImage::display(y)
+  
+  #hist(as.vector(imageData(y)))  #### for visualization purposes in test cases -- Our background is around 0.15-0.2 scaled intensity 
+  
+  
+  #### Compute Haralick features for entire image
+  
+  x <- Image(1,dim=dim(y))   
+  
+  res_method_newData[i,1:26] <- colMeans(computeFeatures.haralick(x, y))
+
+  
+  ### Add mean intensity of image
+  
+  res_method_newData[i,27] <- mean(imageData(y))
+  
+  ### Additional object dependent features 
+  
+  ### explore thresholding for object features 
+
+  ## Local background based thresholding to generate binary image
+  y_2 <- gblur(y,sigma=0.5)  ### mild blurring - sigma must be selected appropriately !
+  
+  #EBImage::display(y_2,all=T)
+
+  cutoff <- 0.3 ## background cutoff selected based on histogram      
+  x <- y_2 > cutoff 
+  
+  #EBImage::display(x,all=T)
+  
+  #if no objects detected, then object feature is 0
+  if(sum(imageData(x))==0){
+    res_method_newData[i,28:46] <- 0
+  } else {
+    res_method_newData[i,28:46] <- c(computeFeatures.moment(x,y), computeFeatures.shape(x), computeFeatures.basic(x,y))
+
+  }
+
+  rownames(res_method_newData)[i] <- gsub("_RGB.tif","",gsub("Images_classify//","",newData[i]))
+}
+
+df_res_newData <- data.frame(res_model_xgboost_lastfit %>% extract_workflow() %>% predict(res_method_newData),res_model_xgboost_lastfit %>% extract_workflow() %>% predict(res_method_newData,type="prob"),rownames(res_method_newData))  
+
+###### Predictions look good for single cells, but a fraction of images have >1 nuclei in field of view - This throws off predictions more in 
+##### favour of territories as its localized in some sense
+
+df_res_newData <- df_res_newData %>% mutate(Genotype=case_when(grepl(newData_categories[1],rownames.res_method_newData.)~newData_categories[1],
+                                                               grepl(newData_categories[2],rownames.res_method_newData.)~newData_categories[2],
+                                                               grepl(newData_categories[3],rownames.res_method_newData.)~newData_categories[3],
+                                                               grepl(newData_categories[4],rownames.res_method_newData.)~newData_categories[4],
+                                                               grepl(newData_categories[5],rownames.res_method_newData.)~newData_categories[5],
+                                                               grepl(newData_categories[6],rownames.res_method_newData.)~newData_categories[6],
+                                                               grepl(newData_categories[7],rownames.res_method_newData.)~newData_categories[7],
+                                                               grepl(newData_categories[8],rownames.res_method_newData.)~newData_categories[8],
+                                                               grepl(newData_categories[9],rownames.res_method_newData.)~newData_categories[9],
+                                                               grepl(newData_categories[10],rownames.res_method_newData.)~newData_categories[10],
+                                                               grepl(newData_categories[11],rownames.res_method_newData.)~newData_categories[11],
+                                                               grepl(newData_categories[12],rownames.res_method_newData.)~newData_categories[12]))
+                                                               
+                                                               
+saveRDS(df_res_newData,"df_res_newData.rds")
+
+head(df_res_newData)
+
+df_res_newData %>% select(Genotype,.pred_class) %>% group_by(Genotype) %>% count(.pred_class) %>% mutate(Fraction=n/sum(n)) %>%
+    ggplot(aes(x=factor(Genotype),y=Fraction,fill=.pred_class)) + geom_col(width=0.75) + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+
+```
+
+While the accuracy can be improved in the future, preliminary results already give us an indication of trends. Clearly full length rox2 generates the most territories. A0B0 and rox1d3c produces a mix of intermediates and territories while the rest are significantly worse at territory formation (.ie. lead to speckled phenotype)
+
+Inspecting emission probabilities of example images gives some ideas on how to improve. In summary, to improve:
+1) Improved class labels for training data -> Some images geniunely appear to have wrong labels
+2) Improved image resolution -> In previous test, images were acquired at twice the resolution compared to this time. Often, not enough pixels cover speckles. Territories appear grainy as well. 
+3) Better preprocessing pipeline -> In multiple cases, we have poor crops where only a part of the nuclei is in the image. Some images have multiple cells. Need to eliminate these images in preprocess pipeline
